@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+sqlalchemy
+python-multipart
+httpx
+pytest
+PyJWT>=2.10,<3
+pwdlib[argon2]>=0.2,<1
+Pillow>=10.0

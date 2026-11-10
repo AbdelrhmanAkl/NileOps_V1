@@ -1,0 +1,427 @@
+
+from datetime import datetime
+from typing import Literal
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, selectinload
+
+from src.api.admin import router as admin_router
+from src.api.auth import router as auth_router
+from src.api.banking import router as banking_router
+from src.api.customers import router as customers_router
+from src.api.complaints import router as complaints_router
+from src.api.dashboard import router as dashboard_router
+from src.api.dashboard import web_router as dashboard_web_router
+from src.api.documents import router as documents_router
+from src.api.explanations import router as explanations_router
+from src.api.policies import router as policies_router
+from src.api.portal import router as portal_router
+from src.core.pii import StaffNote
+from src.core.auth import require_roles
+from src.core.config import get_settings
+from src.db.session import get_db
+from src.models.kyc import (
+    ApplicationStatus,
+    AuditEvent,
+    DocumentStatus,
+    KYCApplication,
+    KYCDocument,
+    utc_now,
+)
+from src.models.user import User
+
+
+settings = get_settings()
+
+app = FastAPI(
+    title="NileOps — مساعد العمليات البنكية",
+    description=(
+        "واجهة برمجية لإدارة طلبات اعرف عميلك (KYC)، "
+        "وعرض المستندات ونتائج التحقق وسجل التدقيق. "
+        "البيانات الحالية اصطناعية لأغراض التطوير والاختبار."
+    ),
+    version="1.0.0",
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
+)
+
+if settings.allowed_host_list != ["*"]:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_host_list)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Baseline hardening for every response (static pages add a stricter CSP)."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    if settings.app_env == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """Send visitors of the bare address to the dashboard."""
+    return RedirectResponse("/dashboard", status_code=307)
+
+
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(banking_router)
+app.include_router(customers_router)
+app.include_router(complaints_router)
+app.include_router(documents_router)
+app.include_router(dashboard_router)
+app.include_router(dashboard_web_router)
+app.include_router(explanations_router)
+app.include_router(policies_router)
+app.include_router(portal_router)
+
+
+class ApplicationSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    application_number: str
+    customer_name: str
+    application_type: str
+    status: str
+    branch_name: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApplicationListResponse(BaseModel):
+    message: str
+    total: int
+    page: int
+    page_size: int
+    items: list[ApplicationSummary]
+
+
+class DocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    document_type: str
+    status: str
+    file_name: str | None
+    reviewer_notes: str | None
+    uploaded_at: datetime | None
+    created_at: datetime
+
+
+class ValidationResultResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    rule_code: str
+    title_ar: str
+    details_ar: str
+    severity: str
+    passed: bool
+    evidence: dict | list | None
+    created_at: datetime
+
+
+class AuditEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    action: str
+    actor_type: str
+    actor_name: str | None
+    details_ar: str
+    previous_status: str | None
+    new_status: str | None
+    created_at: datetime
+
+
+class ApplicationDetail(ApplicationSummary):
+    national_id_last_four: str | None
+    notes: str | None
+    documents: list[DocumentResponse]
+    validation_results: list[ValidationResultResponse]
+    audit_events: list[AuditEventResponse]
+
+
+class ReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal[
+        "IN_REVIEW",
+        "NEEDS_INFORMATION",
+        "APPROVED",
+        "REJECTED",
+    ]
+    notes: StaffNote
+
+
+class ReviewResponse(BaseModel):
+    message: str
+    application_id: int
+    application_number: str
+    previous_status: str
+    new_status: str
+    reviewer_name: str
+    audit_event_id: int
+
+
+REVIEW_STATUS_MAP = {
+    "IN_REVIEW": ApplicationStatus.IN_REVIEW.value,
+    "NEEDS_INFORMATION": ApplicationStatus.NEEDS_INFORMATION.value,
+    "APPROVED": ApplicationStatus.APPROVED.value,
+    "REJECTED": ApplicationStatus.REJECTED.value,
+}
+
+ALLOWED_TRANSITIONS = {
+    ApplicationStatus.PENDING.value: {
+        ApplicationStatus.IN_REVIEW.value,
+        ApplicationStatus.NEEDS_INFORMATION.value,
+    },
+    ApplicationStatus.IN_REVIEW.value: {
+        ApplicationStatus.NEEDS_INFORMATION.value,
+        ApplicationStatus.APPROVED.value,
+        ApplicationStatus.REJECTED.value,
+    },
+    ApplicationStatus.NEEDS_INFORMATION.value: {
+        ApplicationStatus.IN_REVIEW.value,
+    },
+}
+
+REQUIRED_DOCUMENT_TYPES = {
+    "بطاقة الرقم القومي",
+    "إثبات العنوان",
+    "استمارة بيانات العميل",
+}
+
+
+@app.get(
+    "/health",
+    tags=["صحة النظام"],
+    summary="فحص التطبيق وقاعدة البيانات",
+)
+def health_check(db: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="قاعدة البيانات غير متاحة حاليًا.",
+        ) from exc
+
+    return {
+        "status": "healthy",
+        "application": settings.app_name,
+        "database": "connected",
+        "message": "التطبيق يعمل وقاعدة البيانات متصلة.",
+    }
+
+
+@app.get(
+    "/api/v1/kyc/applications",
+    response_model=ApplicationListResponse,
+    tags=["طلبات اعرف عميلك"],
+    summary="عرض طلبات العملاء",
+)
+def list_applications(
+    q: str | None = Query(
+        default=None,
+        description="البحث برقم الطلب أو اسم العميل",
+        max_length=150,
+    ),
+    status: str | None = Query(
+        default=None,
+        description="تصفية الطلبات حسب الحالة",
+        max_length=50,
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(
+        require_roles("viewer", "reviewer", "admin")
+    ),
+    db: Session = Depends(get_db),
+) -> ApplicationListResponse:
+    statement = select(KYCApplication)
+
+    if q and q.strip():
+        search_term = q.strip()
+        statement = statement.where(
+            or_(
+                KYCApplication.application_number.contains(search_term),
+                KYCApplication.customer_name.contains(search_term),
+            )
+        )
+
+    if status:
+        statement = statement.where(KYCApplication.status == status)
+
+    count_statement = select(func.count()).select_from(
+        statement.order_by(None).subquery()
+    )
+    total = db.scalar(count_statement) or 0
+
+    applications = db.scalars(
+        statement.order_by(KYCApplication.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+
+    return ApplicationListResponse(
+        message="تم استرجاع طلبات العملاء بنجاح.",
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[
+            ApplicationSummary.model_validate(application)
+            for application in applications
+        ],
+    )
+
+
+@app.get(
+    "/api/v1/kyc/applications/{application_id}",
+    response_model=ApplicationDetail,
+    tags=["طلبات اعرف عميلك"],
+    summary="عرض تفاصيل طلب ومستنداته ونتائج التحقق",
+)
+def get_application(
+    application_id: int,
+    current_user: User = Depends(
+        require_roles("viewer", "reviewer", "admin")
+    ),
+    db: Session = Depends(get_db),
+) -> ApplicationDetail:
+    statement = (
+        select(KYCApplication)
+        .where(KYCApplication.id == application_id)
+        .options(
+            selectinload(KYCApplication.documents),
+            selectinload(KYCApplication.validation_results),
+            selectinload(KYCApplication.audit_events),
+        )
+    )
+
+    application = db.scalar(statement)
+
+    if application is None:
+        raise HTTPException(
+            status_code=404,
+            detail="طلب العميل غير موجود.",
+        )
+
+    return ApplicationDetail.model_validate(application)
+
+
+@app.post(
+    "/api/v1/kyc/applications/{application_id}/review",
+    response_model=ReviewResponse,
+    tags=["المراجعة البشرية"],
+    summary="تسجيل قرار المراجع البشري",
+)
+def review_application(
+    application_id: int,
+    payload: ReviewRequest,
+    current_user: User = Depends(
+        require_roles("reviewer", "admin")
+    ),
+    db: Session = Depends(get_db),
+) -> ReviewResponse:
+    application = db.scalar(
+        select(KYCApplication)
+        .where(KYCApplication.id == application_id)
+        .with_for_update()
+    )
+
+    if application is None:
+        raise HTTPException(
+            status_code=404,
+            detail="طلب العميل غير موجود.",
+        )
+
+    previous_status = application.status
+    new_status = REVIEW_STATUS_MAP[payload.decision]
+
+    if new_status not in ALLOWED_TRANSITIONS.get(previous_status, set()):
+        raise HTTPException(
+            status_code=409,
+            detail="انتقال حالة الطلب غير مسموح به.",
+        )
+
+    if new_status == ApplicationStatus.APPROVED.value:
+        documents = db.scalars(
+            select(KYCDocument).where(
+                KYCDocument.application_id == application_id
+            )
+        ).all()
+
+        documents_by_type: dict[str, list[KYCDocument]] = {}
+
+        for document in documents:
+            documents_by_type.setdefault(
+                document.document_type, []
+            ).append(document)
+
+        all_documents_valid = all(
+            len(documents_by_type.get(document_type, [])) == 1
+            and documents_by_type[document_type][0].status
+            == DocumentStatus.VALID.value
+            for document_type in REQUIRED_DOCUMENT_TYPES
+        )
+
+        if not all_documents_valid:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "لا يمكن اعتماد الطلب قبل التأكد من استيفاء "
+                    "المستندات المطلوبة ومراجعتها بشريًا."
+                ),
+            )
+
+    try:
+        application.status = new_status
+        application.updated_at = utc_now()
+
+        audit_event = AuditEvent(
+            application_id=application.id,
+            action="HUMAN_REVIEW",
+            actor_type="human",
+            actor_name=current_user.username,
+            details_ar=payload.notes.strip(),
+            previous_status=previous_status,
+            new_status=new_status,
+        )
+        db.add(audit_event)
+        db.flush()
+
+        response = ReviewResponse(
+            message="تم تسجيل قرار المراجعة بنجاح.",
+            application_id=application.id,
+            application_number=application.application_number,
+            previous_status=previous_status,
+            new_status=new_status,
+            reviewer_name=current_user.username,
+            audit_event_id=audit_event.id,
+        )
+
+        db.commit()
+        return response
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="تعذر حفظ قرار المراجعة. حاول مرة أخرى.",
+        ) from exc

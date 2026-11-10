@@ -1,0 +1,118 @@
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field, SecretStr, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    app_name: str = "NileOps"
+    app_env: Literal["development", "testing", "production"] = "development"
+    app_debug: bool = False
+
+    database_url: str = "sqlite:///./data/nileops.db"
+    # Deployment hardening. ALLOWED_HOSTS is a comma-separated list (e.g. "ops.example.com").
+    allowed_hosts: str = "*"
+    docs_enabled: bool = True
+    # Customer portal: let visitors create their own customer account.
+    allow_self_registration: bool = True
+
+    upload_dir: str = "storage"
+    max_upload_size_mb: int = Field(default=10, ge=1, le=50)
+
+    # OCR (Tesseract). Set TESSERACT_CMD to the full path on Windows if needed.
+    tesseract_cmd: str = "tesseract"
+    ocr_languages: str = Field(default="ara+eng", pattern=r"^[a-z_+]{3,40}$")
+    ocr_timeout_seconds: int = Field(default=60, ge=5, le=300)
+    ocr_min_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
+    ocr_max_pdf_pages: int = Field(default=3, ge=1, le=10)
+
+    # Policy knowledge base (RAG) and the optional local LLM (e.g. Qwen via Ollama).
+    policies_dir: str = "knowledge/policies"
+    rag_top_k: int = Field(default=3, ge=1, le=8)
+    rag_min_coverage: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Grey zone [rag_llm_min_coverage, rag_min_coverage): only a local LLM may answer.
+    rag_llm_min_coverage: float = Field(default=0.25, ge=0.0, le=1.0)
+    llm_provider: Literal["none", "ollama"] = "none"
+    llm_base_url: str = "http://localhost:11434"
+    llm_model: str = Field(default="qwen2.5:7b-instruct", max_length=80)
+    llm_timeout_seconds: int = Field(default=90, ge=5, le=600)
+
+    jwt_secret_key: SecretStr = Field(
+        min_length=32,
+        validation_alias="JWT_SECRET_KEY",
+    )
+    jwt_algorithm: Literal["HS256"] = "HS256"
+    access_token_expire_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=60,
+    )
+
+    @property
+    def allowed_host_list(self) -> list[str]:
+        return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()] or ["*"]
+
+    @property
+    def resolved_upload_dir(self) -> Path:
+        """Return the upload directory resolved against the project root."""
+        path = Path(self.upload_dir)
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @property
+    def resolved_policies_dir(self) -> Path:
+        path = Path(self.policies_dir)
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @model_validator(mode="after")
+    def validate_security_settings(self):
+        """Validate security-sensitive application settings."""
+        secret = self.jwt_secret_key.get_secret_value()
+
+        if len(secret) < 32:
+            raise ValueError(
+                "JWT_SECRET_KEY must contain at least 32 characters."
+            )
+
+        if secret == (
+            "REPLACE_WITH_A_RANDOM_SECRET_OF_AT_LEAST_32_CHARACTERS"
+        ):
+            raise ValueError(
+                "JWT_SECRET_KEY must be replaced with a random secret."
+            )
+
+        if self.app_env == "production" and self.app_debug:
+            raise ValueError(
+                "APP_DEBUG must be false in production."
+            )
+
+        if self.app_env == "production":
+            if self.allowed_host_list == ["*"]:
+                raise ValueError(
+                    "ALLOWED_HOSTS must list the real host names in production (not '*')."
+                )
+            if self.docs_enabled:
+                raise ValueError(
+                    "DOCS_ENABLED must be false in production."
+                )
+
+        return self
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the cached application settings."""
+    return Settings()
